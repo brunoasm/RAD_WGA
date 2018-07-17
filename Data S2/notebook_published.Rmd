@@ -1,0 +1,1228 @@
+---
+title: "Article S2 - Effects of whole genome amplification"
+output:
+  pdf_document:
+    toc: yes
+    df_print: kable
+  html_document:
+    code_folding: hide
+    df_print: paged
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+
+This notebook contains code to reproduce analyses and graphs from Medeiros & Farrell (PeerJ, 2018).
+
+First, we start by reading packages, tables, functions, etc.
+
+```{r, message=FALSE}
+rm(list=ls())
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(RColorBrewer)
+library(ggthemes)
+library(ggdendro)
+library(MDMR)
+library(scales)
+library(gridExtra)
+library(plyr)
+library(dplyr)
+library(knitr)
+
+#this function will be important for plots
+make_WGA_labels = function(labels){
+  labels = lapply(labels, as.character)
+  labels = lapply(labels, function(x) if (x == 'TRUE') {return('MDA')} else {return('gDNA')})
+  return(labels)}
+
+#function to do logit transformation
+logit = function(vec){
+  log(vec/(1-vec))
+}
+
+#reverse logit function
+inv_logit = function(vec){
+  exp(vec) / (exp(vec) + 1)
+}
+
+sample_info_all = read.csv('sample_info_new_WGA.csv')
+
+sample_info_all$pool = factor(sample_info_all$pool)
+#sample_info_all$WGA = factor(sample_info_all$WGA,levels=c('FALSE','TRUE'),ordered = T)
+
+#this records the total number of loci in the final dataset for each taxon
+Nfinal = c('Anchylorhynchus' = 42240,
+           'Andranthobius' = 17769,
+           'Celetes_impar' = 27624,
+           'Microstrates_bondari' = 17344,
+           'Microstrates_ypsilon' = 17712)
+
+#this is the fraction of loci in the final dataset recovered for a sample
+sample_info_all$Pfinal = sample_info_all$N_loci_s7/Nfinal[as.character(sample_info_all$taxon)]
+
+#let's also read statistics from ipyrad s3 and merge them with sample info table
+s3_stats = read.table('s3_cluster_stats.txt',header = T,sep = '')
+s3_stats$samplename_ipyrad = rownames(s3_stats)
+
+sample_info_all = sample_info_all %>% left_join(s3_stats)
+
+head(sample_info_all)
+
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+
+```
+
+
+# Does the amount of input DNA into the MDA reaction affect number of loci assembled?
+
+Here we will test whether using smaller amounts of template DNA in the MDA reaction decreases the number of loci that can be assembled.
+
+We start with a model with number of loci as response and the following predictors:
+* Amount of inpout genomic DNA in the MDA reactions (ng)
+* log-transformed number of reads.
+
+We will use R function step to try to simplify the model and will report the final model. 
+
+Below are the diagnostic plots and the output for the chosen model. In the best model, number of loci increases with number of reads and decreases with quantity of DNA:
+
+```{r}
+
+temp_data = sample_info_all[c('clusters_hidepth','WGA_input_ng','taxon','pool','reads_passed_filter')]
+temp_data$log_reads = log(sample_info_all$reads_passed_filter)
+temp_data$log_clusters = log(sample_info_all$clusters_hidepth)
+temp_data$N_clusters = sample_info_all$clusters_hidepth
+
+temp_data = temp_data[!is.na(temp_data$WGA_input_ng),]
+
+ng_model_full = lmer(N_clusters ~ WGA_input_ng * log_reads + (1 | taxon) + (1 | pool) , data = temp_data, REML = TRUE)
+
+step_out = step(ng_model_full,reduce.random = FALSE)
+
+ng_model = get_model(step_out)
+plot(ng_model)
+qqnorm(resid(ng_model))
+summary(ng_model)
+```
+
+A graph with data and model predictions makes it more clear:
+
+```{r}
+line_seq = log(10^seq(2,6.3,0.01))
+line_df = data.frame(log_reads =line_seq,
+                     WGA_input_ng=rep(c(50,100,300),each=length(line_seq)))
+predicted = predict(ng_model, line_df ,re.form= NA)
+prediction = cbind(line_df,x=exp(line_df$log_reads)/1000,y=predicted)
+
+
+
+p = ggplot(sample_info_all[!is.na(sample_info_all$WGA_input_ng),]) +
+  geom_point(aes(x = reads_passed_filter/1000, y = clusters_hidepth/1000, colour = WGA_input_ng)) +
+  geom_line(data = prediction, mapping = aes(x=x, y=y/1000, colour = WGA_input_ng, group = WGA_input_ng)) +
+  scale_colour_gradientn(name = 'Input DNA (ng)', 
+                         colours = c(brewer.pal(n = 5,name = 'BrBG')[1],'#c1c18f',brewer.pal(n = 5,name = 'BrBG')[5],"#018571"),
+                         values = rescale(c(0,100,200,357))) +
+  scale_y_continuous(limits = c(0,25)) +
+  #scale_y_log10() +
+  theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  xlab('Reads passing filter (thousands)') +
+  ylab('Loci assembled (thousands)')
+  
+print(p)
+#now plotting to a pdf
+
+pdf(file = 'plots/fig_quantWGA.pdf',width = 7,height = 3.5,useDingbats=F)
+print(p)
+dev.off()
+
+
+```
+
+
+# Assessing nontemplated amplification
+
+## Aligning reads and clusters to references
+Contamination is a potential issue with whole-genome amplification. Therefore, it is important to assess whether there is significant contamination in the samples here.
+
+For that, we used bowtie2 to align reads and also assembled clusters to reference sequences from potential contaminants. These consisted of the repeat-masked human genome (from [ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.25_GRCh38.p10/GCA_000001405.25_GRCh38.p10_genomic.fna.gz], replacing lower-case for Ns) and of reference sequences for each beetle taxon in our dataset. In the absence of reference genomes, the reference sequences were generated from final loci obtained for all libraries which did not undergo whole-genome amplification, dereplicated independently for each taxon using cd-hit at the 95% similarity level. For the reference dataset, we used all libraries available that did not undergo whole-genome amplification, including libraries that were not duplicated and libraries that yielded few clusters.
+
+We then parsed bowtie results and, for each library, counted the number of matches to (1) human genome, (2) to the correct taxon, (3) to incorrect taxa and (4) also sequences that did not match to anything.
+
+
+Before analysing, let's prepare the data. We will make a new dataframe containing only samples with both gDNA and MDA libraries and at least 100 assembled loci.
+
+We will create the following data frames:
+
+* sample_info_sing * will store information for all samples that will have only one library considered
+
+* sample_info_dup * will store information for all samples with two libraries: one with WGA and one without.
+
+* cont_reads * will store counts of reads aligned by bowtie to each reference taxon
+
+* cont_clusters *  is the same as above, but queries consisted of clusters with depth > 7
+
+* cont_final *  is the same as above, but queries consisted of loci in the final dataset
+
+```{r}
+sample_info = sample_info_all[!sample_info_all$excluded_dueto_less_than_100_loci,] #remove samples with <100 clusters
+
+#now remove empty factor levels
+categorical = sapply(sample_info, is.factor)
+sample_info[categorical] = lapply(sample_info[categorical], factor)
+
+samples = levels(sample_info$sample)
+
+duplicate_samples = samples[sapply(samples,function(x) {sum(sample_info$sample == x, na.rm = T)})>1]
+
+duplicate_2methods_samples = as.character(duplicate_samples[sapply(duplicate_samples, function(x){xor(as.logical(sample_info$WGA[sample_info$sample == x][1]),as.logical(sample_info$WGA[sample_info$sample == x][2]))})])
+
+single_samples = setdiff(samples,duplicate_samples)
+
+dup_single_method = setdiff(duplicate_samples,duplicate_2methods_samples)
+
+
+sample_info_dup = sample_info[sample_info$sample %in% duplicate_2methods_samples,]
+sample_info_dup = sample_info_dup[order(sample_info_dup$sample, sample_info_dup$WGA),]
+categorical = sapply(sample_info_dup, is.factor)
+sample_info_dup[categorical] = lapply(sample_info_dup[categorical], factor)
+
+sample_info_sing = sample_info[sample_info$sample %in% single_samples,]
+sample_info_sing = sample_info_sing[order(sample_info_sing$sample, sample_info_sing$WGA),]
+categorical = sapply(sample_info_sing, is.factor)
+sample_info_sing[categorical] = lapply(sample_info_sing[categorical], factor)
+
+
+for (sample in dup_single_method){
+  temp_data = sample_info[sample_info$sample == sample,]
+  sample_info_sing = rbind(sample_info_sing,
+                           temp_data[temp_data$N_loci_s7 == max(temp_data$N_loci_s7),])
+}
+
+
+cont_reads = read.delim("contamination_reads_counts.txt", row.names = 1)
+cont_reads = t(apply(cont_reads,1,function(x){x/sum(x)}))
+
+cont_clusters = read.delim("contamination_clusters_counts.txt", row.names = 1)
+cont_clusters = t(apply(cont_clusters,1,function(x){x/sum(x)}))
+
+cont_final = read.delim("contamination_final_counts.txt", row.names = 1)
+cont_final = t(apply(cont_final,1,function(x){x/sum(x)}))
+
+
+
+```
+
+### Nontemplated amplification at the read level
+A plot of the proportion of raw reads matching each of the categories above. After we got the first reviews back for the manuscript, ggthemes updated colors for the few theme. If running this code with ggthemes v. 3.5.0 or above, you might end up with a different color palette than the one published:
+
+```{r}
+cont_reads_df = data.frame(sample = NULL,ipyrad_sample = NULL, taxon = NULL, match = NULL, frequency = NULL, pool = NULL)
+
+for (sample in unique(row.names(cont_reads))) {
+  if (sample %in% sample_info_dup$samplename_ipyrad){
+  freqs = rep(NA,4)
+  names(freqs) = c('correct','incorrect', 'Homo', 'none')
+  taxon = as.character(sample_info_dup$taxon[sample_info_dup$samplename_ipyrad == sample])
+  freqs['correct'] = cont_reads[sample,taxon]
+  freqs['incorrect'] = sum(cont_reads[sample,!grepl(paste(c(as.character(taxon),'Homo','none'), collapse = '|'),colnames(cont_reads))])
+  freqs['Homo'] = cont_reads[sample,'Homo']
+  freqs['none'] = cont_reads[sample,'none']
+  cont_reads_df = rbind(cont_reads_df, data.frame(sample = strsplit(sample,'pool')[[1]][1], ipyrad_sample = sample, taxon = taxon, match = names(freqs), frequency = freqs, pool = strsplit(sample,'pool')[[1]][2]))
+}
+}
+row.names(cont_reads_df) = NULL
+
+cont_reads_df = merge(cont_reads_df, sample_info_dup[c('samplename_ipyrad','clusters_hidepth','WGA')], by.x = 'ipyrad_sample', by.y = 'samplename_ipyrad')
+
+cont_reads_df$match = factor(as.character(cont_reads_df$match), ordered = T, levels = c('correct', 'incorrect','Homo','none'))
+
+cont_reads_df$Nloci = sapply(cont_reads_df$ipyrad_sample,function(x){sample_info$clusters_hidepth[sample_info$samplename_ipyrad == as.character(x)]})
+
+cont_reads_df$Nreads = sapply(cont_reads_df$ipyrad_sample,function(x){sample_info$reads_passed_filter[sample_info$samplename_ipyrad == as.character(x)]})
+
+#this will make sure samples in the graph dataset are ordered by taxon
+cont_reads_df$sample = factor(as.character(cont_reads_df$sample), ordered=T, levels = unique(cont_reads_df$sample[order(as.character(cont_reads_df$taxon))]))
+
+
+
+p1 = ggplot(cont_reads_df) +
+  geom_bar(aes(x = sample, weight = frequency, fill = match)) +
+  facet_grid(WGA ~ .,labeller = labeller(WGA=make_WGA_labels)) +
+  theme_tufte() +
+  scale_fill_few(palette = 'medium', name = '', labels = setNames(c('Correct','Incorrect','Human','No match'), c('correct', 'incorrect','Homo','none'))) +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+  xlab('Samples') +
+  ylab('Reads passing filter')
+
+print(p1)
+  
+```
+
+There is some background incorrect matches because of the way the reference set was built: some proportion of reads might match to a conserved region in a closely related species (e. g. the two species of Microstrates). Comparing the same samples with and without MDA, we can see that MDA causes widespread increase in proportion of **no match** and occasionally in **incorrect**. We will investigate this further below. 
+
+Now we will do some statistics.
+
+First, is the proportion of incorrect matches increased under MDA, controlling for and number of reads?
+
+It seems it is, and the effect is stronger when we have fewer reads for a sample.
+
+Diagnostic plots and R output:
+
+```{r}
+incorrect_df = cont_reads_df[cont_reads_df$match == 'incorrect',]
+incorrect_df$frequency = cont_reads_df$frequency[cont_reads_df$match == 'incorrect'] + cont_reads_df$frequency[cont_reads_df$match == 'Homo']
+incorrect_df$WGA = factor(incorrect_df$WGA,levels = c('FALSE','TRUE')) #this is just to nicely order the output of the model summary
+incorrect_df$logit_freq = logit(incorrect_df$frequency)
+incorrect_df$log_reads = log(incorrect_df$Nreads)
+
+#full model
+cont_reads_model_full = lmer(logit_freq ~ WGA * log_reads + (1 | taxon/sample), data = incorrect_df, REML = TRUE)
+
+step_out = step(cont_reads_model_full,reduce.random = FALSE)
+step_out
+cont_reads_model = get_model(step_out)
+
+plot(cont_reads_model)
+qqnorm(resid(cont_reads_model))
+summary(cont_reads_model)
+
+
+```
+
+
+Now we will plot the proportion of incorrect matches against number of reads per library. We will connect libraries from the same sample 
+
+```{r}
+line_seq = seq(2,7,0.01)
+line_df = data.frame(log_reads=line_seq, WGA = rep(c(TRUE,FALSE), each = length(line_seq)))
+predicted = predict(cont_reads_model, line_df ,re.form= NA)
+transformed_predicted =  exp(predicted) / (1 + exp(predicted)) #back-logit
+prediction = cbind(line_df,x=10^line_seq,y=transformed_predicted)
+
+segments = data.frame(x1=incorrect_df$Nreads[incorrect_df$WGA == 'FALSE']/1000, 
+                      y1=incorrect_df$frequency[incorrect_df$WGA == 'FALSE'],
+                      x2=incorrect_df$Nreads[incorrect_df$WGA == 'TRUE']/1000,
+                      y2=incorrect_df$frequency[incorrect_df$WGA == 'TRUE'])
+
+
+p4 = ggplot(incorrect_df) +
+  geom_point(aes(x=Nreads/1000,y=frequency,
+                  colour=WGA)) +
+  scale_x_log10(limits=range(incorrect_df$Nreads/1000)) +
+  scale_y_continuous(limits=c(0,0.26),breaks = scales::pretty_breaks(n = 8)) +
+  theme_tufte(base_size=11.1) +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('Proportion of incorrect reads') +
+  xlab('Reads passing filter (thousands)') +
+  geom_segment(data = segments, mapping = aes(x = x1, y = y1, xend = x2, yend = y2), size = 0.1, alpha = 0.7,  arrow=arrow(angle = 30, length = unit(0.05, "inches"),ends = "last", type = "closed"))
+
+print(p4)
+  
+```
+
+### Nontemplated amplification in loci assembled for each sample
+
+Do we see the same effect with loci assembled for each sample (i. e. those that passed the filter of minimum coverage of 7)?
+
+```{r}
+cont_clusters_df = data.frame(sample = NULL,ipyrad_sample = NULL, taxon = NULL, match = NULL, frequency = NULL, pool = NULL)
+
+for (sample in unique(row.names(cont_clusters))) {
+  if (sample %in% sample_info_dup$samplename_ipyrad){
+  freqs = rep(NA,4)
+  names(freqs) = c('correct','incorrect', 'Homo', 'none')
+  taxon = as.character(sample_info_dup$taxon[sample_info_dup$samplename_ipyrad == sample])
+  freqs['correct'] = cont_clusters[sample,taxon]
+  freqs['incorrect'] = sum(cont_clusters[sample,!grepl(paste(c(as.character(taxon),'Homo','none'), collapse = '|'),colnames(cont_clusters))])
+  freqs['Homo'] = cont_clusters[sample,'Homo']
+  freqs['none'] = cont_clusters[sample,'none']
+  cont_clusters_df = rbind(cont_clusters_df, data.frame(sample = strsplit(sample,'pool')[[1]][1], ipyrad_sample = sample, taxon = taxon, match = names(freqs), frequency = freqs,pool = strsplit(sample,'pool')[[1]][2]))
+}
+}
+row.names(cont_clusters_df) = NULL
+
+cont_clusters_df = merge(cont_clusters_df, sample_info_dup[c('samplename_ipyrad','clusters_hidepth','WGA')], by.x = 'ipyrad_sample', by.y = 'samplename_ipyrad')
+
+cont_clusters_df$match = factor(as.character(cont_clusters_df$match), ordered = T, levels = c('correct', 'incorrect','Homo','none'))
+
+
+cont_clusters_df$Nloci = sapply(cont_clusters_df$ipyrad_sample,function(x){sample_info$clusters_hidepth[sample_info$samplename_ipyrad == as.character(x)]})
+
+cont_clusters_df$Nreads = sapply(cont_clusters_df$ipyrad_sample,function(x){sample_info$reads_passed_filter[sample_info$samplename_ipyrad == as.character(x)]})
+
+#this will make sure samples in the graph dataset are ordered by taxon
+cont_clusters_df$sample = factor(as.character(cont_clusters_df$sample), ordered=T, levels = unique(cont_clusters_df$sample[order(as.character(cont_clusters_df$taxon))]))
+
+p2 = ggplot(cont_clusters_df) +
+  geom_bar(aes(x = sample, weight = frequency, fill = match)) +
+  facet_grid(WGA ~ .,labeller = labeller(WGA=make_WGA_labels)) +
+  theme_tufte() +
+  scale_fill_few(palette = 'medium', name = '', labels = setNames(c('Correct','Incorrect','Human','No match'), c('correct', 'incorrect','Homo','none'))) +
+  theme(axis.text.x=element_blank(),
+       axis.ticks.x=element_blank()) +
+  xlab('Samples') +
+  ylab('Loci assembled for each library')
+  
+print(p2)
+```
+
+Just like for reads, there are a few samples with increase in incorrect, but overall the increase does not seem large.
+
+
+```{r}
+incorrect_df = cont_clusters_df[cont_clusters_df$match == 'incorrect',]
+incorrect_df$frequency = cont_clusters_df$frequency[cont_reads_df$match == 'incorrect'] + cont_reads_df$frequency[cont_clusters_df$match == 'Homo']
+
+incorrect_df$sample = factor(incorrect_df$sample,ordered = F)
+incorrect_df$WGA = factor(incorrect_df$WGA,levels = c('FALSE','TRUE')) #this is just to nicely order the output of the model summary
+incorrect_df$logit_freq = log((incorrect_df$frequency+.0001)/(1-incorrect_df$frequency+.0001))
+incorrect_df$log_Nloci = log(incorrect_df$Nloci)
+
+cont_clusters_model_full = lmer(logit_freq ~ WGA * log_Nloci + (1 | taxon/sample), data = incorrect_df, REML = TRUE)
+
+step_out = step(cont_clusters_model_full,reduce.random = F)
+step_out
+cont_clusters_model = get_model(step_out)
+
+plot(cont_clusters_model)
+qqnorm(resid(cont_clusters_model))
+summary(cont_clusters_model)
+summary(incorrect_df$frequency)
+```
+
+
+Now let's look at the proportion incorrect only, against number of loci. Now the maximum proportion incorrect is much smaller:
+
+
+```{r}
+segments = data.frame(x1=incorrect_df$Nloci[incorrect_df$WGA == 'FALSE'], 
+                      y1=incorrect_df$frequency[incorrect_df$WGA == 'FALSE'],
+                      x2=incorrect_df$Nloci[incorrect_df$WGA == 'TRUE'],
+                      y2=incorrect_df$frequency[incorrect_df$WGA == 'TRUE'])
+
+
+
+p5 = ggplot(incorrect_df) +
+  geom_point(aes(x=Nloci,y=frequency,
+                  colour=WGA)) +
+  scale_x_log10(limits=range(incorrect_df$Nloci)) +
+  scale_y_continuous(limits=c(0,0.26),breaks = scales::pretty_breaks(n = 8)) +
+  theme_tufte(base_size=11.1) +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('Proportion of incorrect loci') +
+  xlab('Loci assembled for each library') +
+  geom_segment(data = segments, mapping = aes(x = x1, y = y1, xend = x2, yend = y2), size = 0.1, alpha = 0.7,  arrow=arrow(angle = 30, length = unit(0.05, "inches"),ends = "last", type = "closed"))
+
+print(p5)
+```
+
+
+### Nontemplated amplification in the final dataset
+
+Repeating the same analyses, using loci in the final dataset:
+
+```{r}
+cont_final_df = data.frame(sample = NULL,ipyrad_sample = NULL, taxon = NULL, match = NULL, frequency = NULL, pool = NULL)
+
+for (sample in unique(row.names(cont_final))) {
+  if (sample %in% sample_info_dup$samplename_ipyrad){
+  freqs = rep(NA,4)
+  names(freqs) = c('correct','incorrect', 'Homo', 'none')
+  taxon = as.character(sample_info_dup$taxon[sample_info_dup$samplename_ipyrad == sample])
+  freqs['correct'] = cont_final[sample,taxon]
+  freqs['incorrect'] = sum(cont_final[sample,!grepl(paste(c(as.character(taxon),'Homo','none'), collapse = '|'),colnames(cont_final))])
+  freqs['Homo'] = cont_final[sample,'Homo']
+  freqs['none'] = cont_final[sample,'none']
+  cont_final_df = rbind(cont_final_df, data.frame(sample = strsplit(sample,'pool')[[1]][1], ipyrad_sample = sample, taxon = taxon, match = names(freqs), frequency = freqs,pool = strsplit(sample,'pool')[[1]][2]))
+}
+}
+row.names(cont_final_df) = NULL
+
+
+cont_final_df = merge(cont_final_df, sample_info_dup[c('samplename_ipyrad','N_loci_s7','WGA','clusters_hidepth','Pfinal','reads_passed_filter')], by.x = 'ipyrad_sample', by.y = 'samplename_ipyrad')
+
+cont_final_df$match = factor(as.character(cont_final_df$match), ordered = T, levels = c('correct', 'incorrect','Homo','none'))
+
+
+#this will make sure samples in the graph dataset are ordered by taxon
+cont_final_df$sample = factor(as.character(cont_final_df$sample), ordered=T, levels = unique(cont_final_df$sample[order(as.character(cont_final_df$taxon))]))
+
+p3 = ggplot(cont_final_df) +
+  geom_bar(aes(x = sample, weight = frequency, fill = match)) +
+  facet_grid(WGA ~ .,labeller = labeller(WGA=make_WGA_labels)) +
+  theme_tufte() +
+  scale_fill_few(palette = 'medium', name = '', labels = setNames(c('Correct','Incorrect','Human','No match'), c('correct', 'incorrect','Homo','none'))) +
+  theme(axis.text.x=element_blank(),
+       axis.ticks.x=element_blank()) +
+  xlab('Samples') +
+  ylab('Loci in final dataset')
+
+print(p3)
+```
+
+
+Visually, it is hard to tell whether MDA increases the amount of incorrect matches, which is very low overall. Most alignments are either to the correct species or have no match, in the case of MDA. This is expected, since only non-MDA samples were used for the reference dataset and we might expect some degree of non-overlap in the loci.
+
+Is the effect significant?
+```{r}
+incorrect_df = cont_final_df[cont_final_df$match == 'incorrect',]
+incorrect_df$frequency = cont_final_df$frequency[cont_final_df$match == 'incorrect'] + cont_reads_df$frequency[cont_final_df$match == 'Homo']
+
+incorrect_df$sample = factor(incorrect_df$sample,ordered = F)
+incorrect_df$WGA = factor(incorrect_df$WGA,levels = c('FALSE','TRUE')) #this is just to nicely order the output of the model summary
+incorrect_df$logit_freq = log((incorrect_df$frequency+.0001)/(1-incorrect_df$frequency+.0001))
+incorrect_df$log_N_loci_s7 = log(incorrect_df$N_loci_s7)
+incorrect_df$logit_Pfinal = logit(incorrect_df$Pfinal)
+
+cont_final_model_full = lmer(logit_freq ~ WGA * log_N_loci_s7 + (1 | taxon/sample), data = incorrect_df, REML = TRUE)
+
+step_out = step(cont_final_model_full,reduce.random = F)
+step_out
+cont_final_model = get_model(step_out)
+
+plot(cont_final_model)
+qqnorm(resid(cont_final_model))
+summary(cont_final_model)
+
+```
+
+WGA and the interaction between WGA and number of loci are still significant in the final dataset, but the effect size is even smaller.
+```{r}
+
+segments = data.frame(x1=incorrect_df$N_loci_s7[incorrect_df$WGA == 'FALSE'], 
+                      y1=incorrect_df$frequency[incorrect_df$WGA == 'FALSE'],
+                      x2=incorrect_df$N_loci_s7[incorrect_df$WGA == 'TRUE'],
+                      y2=incorrect_df$frequency[incorrect_df$WGA == 'TRUE'])
+
+
+p6 = ggplot(incorrect_df) +
+  geom_point(aes(x=N_loci_s7,y=frequency,
+                  colour=WGA)) +
+  scale_x_log10(limits=range(incorrect_df$N_loci_s7)) +
+  scale_y_continuous(limits=c(0,0.26),breaks = scales::pretty_breaks(n = 8)) +
+  theme_tufte(base_size=11.1) +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('Proportion of incorrect loci in final dataset') +
+  xlab('Loci in final dataset') +
+  #geom_line(data = prediction, aes(x=x, y=y, colour = WGA)) +
+  geom_segment(data = segments, mapping = aes(x = x1, y = y1, xend = x2, yend = y2), size = 0.1, alpha = 0.7,  arrow=arrow(angle = 30, length = unit(0.05, "inches"),ends = "last", type = "closed"))
+
+print(p6)
+
+```
+
+
+The average increase in proportion of incorrect matches is 0.001 and the maximum is 0.0128:
+
+```{r}
+increases = tapply(X = incorrect_df$frequency, INDEX = incorrect_df$sample, FUN = function(x){x[2]-x[1]})
+increase_df = data.frame(sample = names(increases), increase = increases)
+
+ggplot(increase_df) +
+  geom_violin(aes(x = 1, y = increase)) + 
+  geom_jitter(aes(x = 1, y = increase)) + 
+  ylab(label = 'Increase in the proportion of incorrect alignments.')
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+mean(increases)
+
+max(increases)
+
+```
+
+
+Now plot everything.
+
+```{r}
+
+
+
+hlay=rbind(c(1,1,1,2,2),
+           c(3,3,3,4,4),
+           c(5,5,5,6,6))
+p = grid.arrange(p1,p4,p2,p5,p3,p6,layout_matrix=hlay)
+
+
+ggsave(filename = 'plots/fig_contamination.pdf',plot = p,width = 9*1.3, height = 6*1.3,useDingbats=F)
+dev.off()
+
+
+#This is to help put species names in Adobe Illustrator:
+taxon_pos = data.frame(sample = levels(cont_clusters_df$sample),taxon = as.character(cont_clusters_df$taxon[match(levels(cont_clusters_df$sample), cont_clusters_df$sample)]))
+
+taxon_pos$position = seq(1:dim(taxon_pos)[1])
+
+tapply(taxon_pos$position,taxon_pos$taxon,range)
+```
+
+For publication, we edited thefigure above in Adobe Illustrator, adding taxon names and changing spacing between graphs. The output text above simply shows which bars in the graph correspond to which taxa, to help with image editing.
+
+
+## Comparing same samples with and without whole-genome amplification
+
+It is still possible that there is contamination between closely related samples, which would not be eliminated using a minimum coverage by locus. One way to assess this type of contamination is to compare the genetic distance between a sample and itself. As a baseline, we will also compare each of these gDNA libraries to other gDNA libraries in the same taxon. Cases with likely significant contamination are those in which the distance between a gDNA library and its MDA library is larger than that between a gDNA library and its closest matching conspecific gDNA library. 
+
+We will plot the difference between these distances against the proportion of loci in the final dataset.
+
+The figure below indicates that severe problems might all be among samples with lots of missing data. To avoid biases in the next few analyses, we further remove the MDA and gDNA libraries for the 9 samples with fewest loci in the final dataset for the MDA library
+
+```{r}
+libraries = as.character(sample_info_dup$samplename_ipyrad[sample_info_dup$WGA == F])
+pairwise_distances = 1 - read.csv('pairwise_snps_N_matching_nuc.csv', row.names = 1)/2
+pairwise_loci = read.csv('pairwise_snps_N_loci_total.csv', row.names = 1)
+
+match_plot_df = data.frame(lib = NULL, taxon = NULL, population = NULL, taxpop = NULL, comparison = NULL, matches = NULL)
+
+for (lib in libraries){
+  #first, get comparison to same sample with WGA
+  sample = strsplit(lib,'pool')[[1]][1]
+  taxon = as.character(unique(sample_info_dup$taxon[sample_info_dup$sample == sample]))
+  lib_wga = as.character(sample_info_dup$samplename_ipyrad[sample_info_dup$sample == sample & sample_info_dup$WGA == T])
+  
+  
+  #then to others in the same population
+  criterion_dup = sample_info_dup$sample != as.character(sample) &
+                  sample_info_dup$taxon == as.character(taxon) &
+                  sample_info_dup$WGA == FALSE
+  pop_samples = as.character(sample_info_dup[criterion_dup,'samplename_ipyrad'])
+  Npop = length(pop_samples)
+  
+  if(Npop){
+  indexer = matrix(data = c(rep(lib,Npop), pop_samples), nrow = Npop, byrow = F)
+  indexer = indexer[pairwise_loci[indexer] > 35,]
+  
+  if (is.null(dim(indexer))) {indexer = matrix(indexer, ncol=2)}
+  
+  if (dim(indexer)[1] > 0){
+    match_plot_df = rbind(match_plot_df, data.frame(lib = lib, 
+                                                  taxon = taxon,
+                                                  comparison = 'wga', 
+                                                  matches = pairwise_distances[lib,lib_wga]))
+    
+    match_plot_df = rbind(match_plot_df, data.frame(lib = lib, 
+                                                  taxon = taxon,
+                                                  comparison = 'other',
+                                                  matches = pairwise_distances[indexer]))  
+  }
+  
+  }
+  
+}
+#Now simplify dataframe to get the minimum distance only:
+dist_df = as.data.frame.table(tapply(match_plot_df$matches,match_plot_df[c('lib','comparison')],min), responseName = 'distance')
+dist_df = unique(merge(dist_df,match_plot_df[-length(match_plot_df)],all.y = FALSE))
+dist_df$sample = sapply(dist_df$lib,function(x){strsplit(as.character(x),split='pool')[[1]][1]})
+dist_df = unique(merge(dist_df,sample_info_dup[sample_info_dup$WGA,c('sample','N_loci_s7')],by.x='sample',by.y='sample'))
+
+
+dist_diff_df =  as.data.frame.table(tapply(dist_df$distance,dist_df[c('sample','taxon')],function(x){x[1]-x[2]}),responseName = 'diff_distance')
+dist_diff_df = dist_diff_df[!is.na(dist_diff_df$diff_distance),]
+dist_diff_df = unique(merge(dist_diff_df,dist_df[c('sample','N_loci_s7')]))
+
+#this will make taxa be plotted in correct order in legend
+dist_diff_df$taxon = factor(dist_diff_df$taxon, levels = c('Anchylorhynchus','Andranthobius','Celetes_impar','Microstrates_bondari','Microstrates_ypsilon'))
+
+
+
+p = ggplot(dist_diff_df) +
+  geom_hline(aes(yintercept=0), alpha=0.7) +
+  geom_point(aes(x=N_loci_s7,y=diff_distance,colour=taxon)) +
+  theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_brewer(type = 'qualitative',palette = 'Accent', 
+                      name = 'Taxon', 
+                      labels = c('Anchylorhynchus' = 'Anchylorhynchus',
+                                 'Andranthobius' = 'Andranthobius',
+                                 'Celetes_impar' = 'C. impar',
+                                 'Microstrates_bondari' = 'M. bondari',
+                                 'Microstrates_ypsilon' = 'M. ypsilon')) +
+  scale_x_log10() +
+  xlab('Loci in final dataset for MDA library') +
+  ylab('Difference in genetic distance\n(self MDA - other gDNA library)')
+
+print(p)
+
+
+pdf(file = 'plots/fig_close_contamination.pdf',width = 7,height = 3.5,useDingbats=F)
+print(p)
+dev.off()
+```
+
+Now we will remove the 9 samples with fewest loci in the final dataset:
+
+```{r}
+problems = as.character(dist_diff_df$sample[rank(as.integer(dist_diff_df$N_loci_s7))<=9])
+problems_libs = sample_info_dup$samplename_ipyrad[grepl(paste(problems,
+                                                              collapse = '|'), 
+                                                        sample_info_dup$sample) &
+                                                    sample_info_dup$WGA == TRUE]
+sample_info_sing = rbind(sample_info_sing, sample_info_dup[(sample_info_dup$WGA == F &
+                                                             grepl(paste(problems,
+                                                                         collapse = '|'),
+                                                                   sample_info_dup$sample)),])
+
+prun_sample_info_dup = sample_info_dup[!(grepl(paste(problems, collapse = '|'),
+                                          sample_info_dup$sample)),]
+
+prun_sample_info_dup$WGA = factor(prun_sample_info_dup$WGA, ordered = F, levels = c('FALSE','TRUE'))
+
+```
+
+
+# Comparing MDA and gDNA for number of loci, heterozygosity and GC bias
+
+Here we calculate some statistics for each sample and fit a linear model controlling for covariates. In all cases, taxon and sample nested within taxon are random effects, and WGA is a fixed effect. In the case of comparison of number of clusters, number of reads is a fixed effect, and in the others number of clusters is a fixed effetc. In this section, we only include samples that had libraries prepared both with and without whole genome amplification
+
+
+## Does whole-genome amplification reduce the number of loci obtained in comparison to gDNA libraries?
+
+First, figure out the best model. 
+
+We had to some some scale transformations to fit a linear model:
+* reads were transformed using log10
+* number of clusters was transformed using logit, assuming a maximum of 30000 clusters
+
+
+Then, we use step() to find non-significant coefficients. Model output and disgnostic plots:
+
+```{r}
+max_clusters = 30000 #sample with > 3 mi reads had ~30K clusters 
+
+log_reads = log10(prun_sample_info_dup$reads_passed_filter)
+logit_clusters = log(prun_sample_info_dup$clusters_hidepth/max_clusters/ (1-prun_sample_info_dup$clusters_hidepth/max_clusters)) #logit = log(p/1-p)
+
+
+reads_model_full = lmer(logit_clusters~log_reads + WGA + log_reads:WGA + (1 | taxon/sample), data = prun_sample_info_dup, REML = TRUE)
+
+
+step_out = step(reads_model_full,reduce.random = FALSE)
+step_out
+reads_model = get_model(step_out)
+
+summary(reads_model)
+```
+
+
+```{r}
+plot(reads_model)
+qqnorm(resid(reads_model), main="Q-Q plot for residuals")
+```
+
+
+Yes, it seems that whole-genome amplification decreases the number of clusters obtained for a sample. By how much?
+
+```{r}
+line_seq = seq(2,7,0.01)
+line_df = data.frame(log_reads=line_seq,WGA=rep(c('TRUE','FALSE'),each=length(line_seq)))
+predicted = predict(reads_model, line_df ,re.form= NA)
+transformed_predicted =  exp(predicted) / (1 + exp(predicted)) * max_clusters #back-logit
+#transformed_predicted =  exp(predicted) 
+prediction = cbind(line_df,x=10^line_seq,y=transformed_predicted)
+
+range(prediction$y[prediction$WGA == TRUE & prediction$x > 200000 & prediction$x < 1500000]/prediction$y[prediction$WGA == FALSE & prediction$x > 200000 & prediction$x < 1500000])
+```
+
+WGA results in a reduction of about 58%-72% in the number of clusters for a range of sensible number of reads (200K to 1.5M).
+
+Now, plotting data and model predictions:
+
+```{r}
+
+p = ggplot() +
+  geom_point(data=prun_sample_info_dup,mapping = aes(x = reads_passed_filter/1000, y = clusters_hidepth/1000, colour = WGA)) +
+  scale_x_continuous(limits = c(0,max(prun_sample_info_dup$reads_passed_filter)/1000 + 100) ) +
+  scale_y_continuous(limits = c(0,max(prun_sample_info_dup$clusters_hidepth/1000) + 0.1)) +
+  geom_line(data = prediction, mapping = aes(x=x/1000,y=y/1000, colour = WGA)) +
+   theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('Assembled loci (thousands)') +
+  xlab('Reads passing filter (thousands)')
+
+print(p)
+pdf('plots/fig_nloci.pdf',width = 7,height = 3.5,useDingbats=F)
+print(p)
+dev.off()
+```
+
+## What is the effect of MDA on variance of read depth among loci?
+
+```{r}
+
+log_reads = log10(prun_sample_info_dup$reads_passed_filter)
+sd_coverage = log(prun_sample_info_dup$sd_depth_total)
+
+cov_model_full = lmer(sd_coverage~log_reads + WGA + log_reads:WGA + (1 | taxon/sample), data = prun_sample_info_dup, REML = TRUE)
+
+
+step_out = step(cov_model_full,reduce.random = FALSE)
+step_out
+cov_model = get_model(step_out)
+
+summary(cov_model)
+plot(cov_model)
+qqnorm(resid(cov_model), main="Q-Q plot for residuals")
+
+```
+
+The standard deviation in read depth is affected by MDA, let's plot:
+
+```{r}
+
+line_seq = seq(2,7,0.01)
+line_df = data.frame(log_reads=line_seq,WGA=rep(c('TRUE','FALSE'),each=length(line_seq)))
+predicted = predict(cov_model, line_df ,re.form= NA)
+transformed_predicted = exp(predicted)
+prediction = cbind(line_df,x=10^line_seq,y=transformed_predicted)
+
+p = ggplot() +
+  geom_point(data=prun_sample_info_dup,mapping = aes(x = reads_passed_filter/1000, y = prun_sample_info_dup$sd_depth_total, colour = WGA)) +
+  scale_x_continuous(limits = c(0,max(prun_sample_info_dup$reads_passed_filter)/1000 + 100) ) +
+  scale_y_continuous(limits = c(0,max(prun_sample_info_dup$sd_depth_total) + 100)) +
+  geom_line(data = prediction, mapping = aes(x=x/1000,y=y, colour = WGA)) +
+  #geom_segment(data = segments, mapping = aes(x = x1, y = y1, xend = x2, yend = y2), size = 0.1, alpha = 0.7,  arrow=arrow(angle = 30, length = unit(0.05, "inches"),ends = "last", type = "closed")) +
+  theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('Standard deviation of coverage in assembled loci') +
+  xlab('Reads passing filter (thousands)')
+
+print(p)
+pdf('plots/fig_sdcov.pdf',width = 7,height = 3.5,useDingbats=F)
+print(p)
+dev.off()
+```
+
+
+
+## Does MDA interfere with heterozygosity?
+
+Here we will make two models. One in which number of loci is in the predictors and other in which average coverage replaces it. A model including both at the same time and interactions was too hard to interpret. We will also plot the relationship between average coverage and number of loci. 
+
+Model fitting:
+```{r}
+Nclusters = log(prun_sample_info_dup$clusters_hidepth)
+het = prun_sample_info_dup$N_nucleotides_heteroz/prun_sample_info_dup$N_nucleotides_s7
+avg_depth = log(prun_sample_info_dup$avg_depth_stat)
+
+het_avg_model_full = lmer(het ~ WGA*avg_depth + (1 | taxon/sample), data = prun_sample_info_dup, REML = TRUE)
+step_out = step(het_avg_model_full,reduce.random = FALSE)
+step_out
+het_avg_model = get_model(step_out)
+summary(het_avg_model)
+plot(het_avg_model)
+qqnorm(resid(het_avg_model), main="Q-Q plot for residuals")
+
+
+het_clust_model_full = lmer(het ~ WGA*Nclusters + (1 | taxon/sample), data = prun_sample_info_dup, REML = TRUE)
+step_out = step(het_clust_model_full,reduce.random = FALSE)
+step_out
+het_clust_model = get_model(step_out)
+summary(het_clust_model)
+plot(het_clust_model)
+qqnorm(resid(het_clust_model), main="Q-Q plot for residuals")
+
+
+```
+
+In the case of average depth, the interaction was dropped.
+In the case of number of clusters, the full model was kept.
+
+Let's visualize the effects in both models:
+```{r}
+line_seq = log(seq(1,25000,100))
+line_df = data.frame(Nclusters=line_seq,WGA=rep(c('TRUE','FALSE'),each=length(line_seq)))
+prediction = cbind(line_df,x=exp(line_seq),y=predict(het_clust_model, line_df ,re.form= NA))
+
+p1 = ggplot(prun_sample_info_dup) +
+  geom_jitter(aes(x=clusters_hidepth/1000,y=N_nucleotides_heteroz/N_nucleotides_s7,
+                  colour=WGA)) +
+  scale_x_continuous(limits = range(prun_sample_info_dup$clusters_hidepth)/1000+c(-0.1,0.1)) +
+  scale_y_continuous(limits = c(0,max(prun_sample_info_dup$N_nucleotides_heteroz/prun_sample_info_dup$N_nucleotides_s7)+0.0005)) +
+  theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('Observed heterozygosity') +
+  xlab('Assembled loci (thousands)') +
+  geom_line(data = prediction, aes(x=x/1000,y=y,colour=WGA))
+  
+
+print(p1)
+```
+
+Now let's look at the effect of average coverage alone.
+
+```{r}
+line_seq = log(seq(5,300,by = 0.1))
+line_df = data.frame(avg_depth=line_seq,WGA=rep(c('TRUE','FALSE'),each=length(line_seq)))
+prediction = cbind(line_df,x=exp(line_seq),y=predict(het_avg_model, line_df ,re.form= NA))
+
+p2 = ggplot(prun_sample_info_dup) +
+  geom_jitter(aes(x=avg_depth_stat,y=N_nucleotides_heteroz/N_nucleotides_s7,
+                  colour=WGA)) +
+  scale_x_continuous(limits = range(prun_sample_info_dup$avg_depth_stat)+c(-5,10)) +
+  scale_y_continuous(limits = c(0,max(prun_sample_info_dup$N_nucleotides_heteroz/prun_sample_info_dup$N_nucleotides_s7)+0.0005)) +
+  theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('Observed heterozygosity') +
+  xlab('Average coverage in assembled loci') +
+  geom_line(data = prediction, aes(x=x,y=y,colour=WGA))
+  
+
+print(p2)
+```
+
+
+Finally, let's plot the relationship between assembled loci and average coverage:
+
+```{r}
+p3 = ggplot(prun_sample_info_dup) +
+  geom_point(aes(x=clusters_hidepth/1000,y=avg_depth_stat,color=WGA)) +
+  theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('Average coverage in assembled loci') +
+  xlab('Assembled loci (thousands)')
+
+print(p3)
+  
+```
+
+Now let's plot the 3 of them together:
+
+```{r}
+#extract legend
+#https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+my_legend = g_legend(p1)
+
+p = grid.arrange(p1 + theme(legend.position='none'),
+             p3 + theme(legend.position='none'),
+             p2 + theme(legend.position='none'),
+             my_legend,
+             layout_matrix=matrix(c(1,1,1,2,2,2,3,3,3,4),nrow=1))
+
+ggsave(filename = 'plots/fig_het.pdf',device = 'pdf',width = 8,height = 3,plot = p,useDingbats=F)
+```
+
+
+
+## 4 - does WGA bias the GC content?
+
+It seems MDA does not change GC content.
+
+There is a small effect of number of loci. If Illumina sequencing preferentially sequences GC-rich fragments, we should expect some GC enrichment in low-coverage samples.
+
+Model fitting:
+
+```{r}
+GC_data = prun_sample_info_dup
+GC_data$Nclusters = log(GC_data$clusters_hidepth)
+GC_data$GC = GC_data$GC_content
+GC_model_full = lmer(GC ~ Nclusters + WGA + Nclusters:WGA + (1 | taxon/sample), data = GC_data)
+
+step_out = step(GC_model_full,reduce.random = FALSE)
+GC_model = get_model(step_out)
+summary(GC_model)
+plot(GC_model)
+qqnorm(resid(GC_model), main="Q-Q plot for residuals")
+
+```
+
+Plot:
+
+```{r}
+
+
+line_seq = log(seq(1,25000,100))
+line_df = data.frame(Nclusters=line_seq)
+prediction = cbind(line_df,x=exp(line_seq),y=predict(GC_model, line_df ,re.form= NA))
+ 
+
+p = ggplot(prun_sample_info_dup) +
+  geom_jitter(aes(x=clusters_hidepth/1000,y=GC_content,
+                  colour=WGA)) +
+  scale_x_continuous(limits = range(prun_sample_info_dup$clusters_hidepth)/1000 + c(-.1,.1)) +
+  theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(3,1)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+  ylab('%GC') +
+  xlab('Assembled loci (thousands)') +
+  geom_line(data = prediction, aes(x=x/1000,y=y)) #+
+  
+print(p)
+
+pdf('plots/fig_gc.pdf',width = 7,height = 3.5,useDingbats=F)
+print(p)
+dev.off()
+```
+
+# Are errors and biases caused by MDA large enough to impair analyses?
+
+Considering all the above, we are now interested in knowing whether samples that have undergone MDA would erroneuosly cluster together if we do clustering by genetic similarity. In order to do that, we will use MDMR, a regression method in which the response is a pairwise distance matrix.
+
+Here we computed the pairwise genetic distance between all samples. In the python script, we actually calculated, for each site, `2-(number of shared alleles)`, and averaged over all sites. Here we divide this score by 2, so that the distance is in the scale 0-1.
+
+First, prepare data frame for plotting and data analysis.
+
+```{r warning=FALSE}
+plot_df = data.frame(sample = NULL, pool = NULL,samplename_ipyrad = NULL,taxon=NULL,population=NULL, WGA_from = NULL, WGA_to = NULL, Nloci = NULL, ave_gaps = NULL, ave_matches = NULL)
+
+
+for (i in 1:dim(prun_sample_info_dup)[1]){
+  sample = prun_sample_info_dup$sample[i]
+  fullname_i = paste(sample,'pool',sprintf("%02s",prun_sample_info_dup$pool[i]), sep = "")
+  
+  #first compare statistics to self
+  other = setdiff(which(prun_sample_info_dup$sample == sample),i)
+  fullname_other = paste(sample,'pool',sprintf("%02s",prun_sample_info_dup$pool[other]), sep = "")
+  loci = pairwise_loci[fullname_i,fullname_other]
+  matches = pairwise_distances[fullname_i,fullname_other]
+  
+  #then to other samples in the same population
+  population = prun_sample_info_dup$population[i]
+  taxon = prun_sample_info_dup$taxon[i]
+  
+  #WGA true
+  criterion_dup = prun_sample_info_dup$sample != as.character(sample) &
+                  prun_sample_info_dup$taxon == as.character(taxon) &
+                  prun_sample_info_dup$population == as.character(population) &
+                  prun_sample_info_dup$WGA == TRUE
+  temp_df = prun_sample_info_dup[criterion_dup,]
+  criterion_sing = sample_info_sing$sample != as.character(sample) &
+                   sample_info_sing$taxon == as.character(taxon) &
+                   sample_info_sing$population == as.character(population) &
+                   sample_info_sing$WGA == TRUE
+  temp_df = rbind(temp_df, sample_info_sing[criterion_sing,])
+
+  temp_loci = c()
+  temp_distances = c()
+  for (j in 1:dim(temp_df)[1]){
+    fullname_other = paste(temp_df$sample[j],'pool',sprintf("%02s",temp_df$pool[j]), sep = "")
+    temp_loci = c(temp_loci, pairwise_loci[fullname_i,fullname_other])
+    temp_distances = c(temp_distances, pairwise_distances[fullname_i,fullname_other])
+  }
+  plot_df = rbind(plot_df,data.frame(sample = sample,
+                                     pool = as.character(prun_sample_info_dup$pool[i]),
+                                     samplename_ipyrad = as.character(prun_sample_info_dup$samplename_ipyrad[i]),
+                                     taxon = as.character(prun_sample_info_dup$taxon[i]),
+                                     population = as.character(prun_sample_info_dup$population[i]),
+                                     WGA_from = prun_sample_info_dup$WGA[i],
+                                     WGA_to = as.character(TRUE),
+                                     Nloci = mean(temp_loci, na.rm=T),
+                                     ave_matches = mean(temp_distances, na.rm=T)
+                                     ))
+  
+  
+  #WGA false
+  criterion_dup = prun_sample_info_dup$sample != as.character(sample) &
+                  prun_sample_info_dup$taxon == as.character(taxon) &
+                  prun_sample_info_dup$population == as.character(population) &
+                  prun_sample_info_dup$WGA == FALSE
+  temp_df = prun_sample_info_dup[criterion_dup,]
+  criterion_sing = sample_info_sing$sample != as.character(sample) &
+                   sample_info_sing$taxon == as.character(taxon) &
+                   sample_info_sing$population == as.character(population) &
+                   sample_info_sing$WGA == FALSE
+  temp_df = rbind(temp_df, sample_info_sing[criterion_sing,])
+
+  for (j in 1:dim(temp_df)[1]){
+    fullname_other = paste(temp_df$sample[j],'pool',sprintf("%02s",temp_df$pool[j]), sep = "")
+    temp_loci = c(temp_loci, pairwise_loci[fullname_i,fullname_other])
+    temp_distances =c(temp_distances, pairwise_distances[fullname_i,fullname_other])
+  }
+  plot_df = rbind(plot_df,data.frame(sample = sample,
+                                     pool = as.character(prun_sample_info_dup$pool[i]),
+                                     samplename_ipyrad = as.character(prun_sample_info_dup$samplename_ipyrad[i]),
+                                     taxon = as.character(prun_sample_info_dup$taxon[i]),
+                                     population = as.character(prun_sample_info_dup$population[i]),
+                                     WGA_from = prun_sample_info_dup$WGA[i],
+                                     WGA_to = as.character(FALSE),
+                                     Nloci = mean(temp_loci, na.rm=T),
+                                     ave_matches = mean(temp_distances, na.rm=T)
+                                     ))
+}
+
+plot_df[is.na(plot_df)] = 0
+```
+
+
+Here we will use the matrix of pairwise genetic distances as a response, and MDA, population and number of loci as predictors. The model will be fit separately for each taxon using MDMR. 
+
+MDA is not significant in any case. The closest to significance is Anchylorhynchus (0.126 when I ran it for the article, but may vary slightly below due to random permutation). In any case, the pseudo R2 is very small in this case (0.009), so MDA does not seem to be a major factor in clustering.
+
+
+```{r warning=FALSE}
+for (taxon in c('Anchylorhynchus','Andranthobius','Celetes_impar','Microstrates_bondari','Microstrates_ypsilon')){
+  samples = as.character(prun_sample_info_dup$samplename_ipyrad[prun_sample_info_dup$taxon == taxon])
+  
+  #some samples do not have any loci in common, removing those
+  gendist = pairwise_distances[samples,samples]
+  na_rows = apply(gendist,1,function(x){any(is.na(x))})
+  na_samples = sapply(names(na_rows)[which(na_rows)],function(x){strsplit(x,'pool')[[1]][1]})
+  if (length(na_samples)){
+    rows_to_remove = grepl(paste(na_samples,collapse='|'),rownames(gendist))
+    gendist = gendist[!rows_to_remove,!rows_to_remove]
+  }
+  
+  gendist = as.dist(gendist)
+  
+  samples = labels(gendist)
+  
+  cat(paste('\n\n\n','Number of libraries',length(samples), ':\n'))
+  
+  
+  predictors = prun_sample_info_dup[match(samples,prun_sample_info_dup$samplename_ipyrad),c('WGA','population','N_loci_s7')]
+  
+  
+  variables = colnames(predictors)
+  predictors = data.frame(factor(predictors[[1]]),factor(predictors[[2]]),log(as.integer(predictors[[3]])))
+  colnames(predictors) = variables
+  rownames(predictors) = samples
+  
+  mdmr_model = mdmr(D = gendist, X = predictors)
+  cat(paste('\n\n\n',taxon,'\n\n'))
+  summary(mdmr_model)
+
+  
+}
+```
+
+Now let's do hierarchical clustering with method single (aka neighbor-joining) and plot the results:
+```{r, results='asis'}
+plot_list = list()
+for (taxon in c('Anchylorhynchus','Andranthobius','Celetes_impar','Microstrates_bondari','Microstrates_ypsilon')){
+  samples = as.character(prun_sample_info_dup$samplename_ipyrad[prun_sample_info_dup$taxon == taxon])
+  
+  #some samples do not have any loci in common, removing those
+  gendist = pairwise_distances[samples,samples]
+  na_rows = apply(gendist,1,function(x){any(is.na(x))})
+  na_samples = sapply(names(na_rows)[which(na_rows)],function(x){strsplit(x,'pool')[[1]][1]})
+  if (length(na_samples)){
+    rows_to_remove = grepl(paste(na_samples,collapse='|'),rownames(gendist))
+    gendist = gendist[!rows_to_remove,!rows_to_remove]
+  }
+  
+  gendist = as.dist(gendist)
+  
+  samples = labels(gendist)
+  
+  
+  predictors = prun_sample_info_dup[match(samples,prun_sample_info_dup$samplename_ipyrad),c('WGA','population','clusters_hidepth')]
+  
+  
+  variables = colnames(predictors)
+  predictors = data.frame(factor(predictors[[1]]),factor(predictors[[2]]),log(as.integer(predictors[[3]])))
+  colnames(predictors) = variables
+  rownames(predictors) = samples
+  
+  temp_dendro = as.dendrogram(hclust(gendist,method = 'single'))
+  temp_ddata = dendro_data(temp_dendro, type = 'rectangle')
+  segments = segment(temp_ddata)
+  segments_tips = segments[segments$yend == 0,]
+  tips = label(temp_ddata)
+  tips$pop = as.character(sample_info_all$population[match(tips$label,sample_info_all$samplename_ipyrad)])
+  tips$sample = sapply(tips$label,function(x){strsplit(as.character(x),'pool')[[1]][1]})
+  segments$pop = ''
+  segments$pop[segments$yend == 0][match(tips$x,segments$xend[segments$yend == 0])] = as.character(tips$pop)
+  
+  taxon_translate = c('Anchylorhynchus' = 'Anchylorhynchus',
+                                 'Andranthobius' = 'Andranthobius',
+                                 'Celetes_impar' = 'C. impar',
+                                 'Microstrates_bondari' = 'M. bondari',
+                                 'Microstrates_ypsilon' = 'M. ypsilon')
+  
+  plot_temp =     ggplot(segments) +
+      geom_segment(aes(x = x, y = y, xend = xend, yend = yend, colour = pop), size = 1) +
+      theme_dendro() +
+      scale_colour_manual(values = c('#000000',brewer.pal(length(unique(tips$pop)),name = 'Set3')),
+                          name = 'Population') +
+      ggtitle(bquote(italic(.(taxon_translate[taxon])))) +
+      coord_flip() +
+      scale_y_reverse(expand=c(0.2,0)) +
+      geom_text(data = tips, aes(x=x,y=y-0.0001,label=sample), size=2, hjust=0)
+  print(plot_temp)
+  plot_list[[length(plot_list)+1]] = plot_temp
+}
+```
+
+Repeating above, now plotting to a file:
+
+```{r, results='asis'}
+pdf('plots/supp_figs.pdf',width=7.5,height=10,useDingbats=F)
+do.call(grid.arrange,c(plot_list,list('ncol'=2)))
+dev.off()
+```
+
+
+# Are the loci sequenced with MDA are biased subset of loci sequenced with gDNA libraries?
+For each taxon, each kind of library (gDNA or MDA) was typically pooled together for ligation and size selection. Therefore, we expect ligation and size selection effects (i. e. pool effects) to affect all loci sequenced for a given pool. However, since we have multiple pools for each treatment for each taxon, we can try to parse out pool and MDA effects in a MDMR analysis. 
+
+Our response pairwise distance variable will be the proportion of loci recovered for just one of the samples in the comparison, and our predictors will be the number of reads, the ligation pool, whether MDA was performed and population. We will include all samples for this analysis, since not sharing any locus is also important information, and we cannot distinguish pool from MDA effects only within paired samples.
+
+```{r}
+pairwise_all_loci = read.csv('pairwise_N_loci_total.csv',row.names = 1)
+
+for (taxon1 in c('Anchylorhynchus','Andranthobius','Celetes_impar','Microstrates_bondari','Microstrates_ypsilon')){
+  samples = sample_info %>%
+    filter(taxon == taxon1) %>%
+    select(samplename_ipyrad) %>%
+    unlist %>%
+    as.character
+    
+  #as.character(prun_sample_info_dup$samplename_ipyrad[prun_sample_info_dup$taxon == taxon])
+  
+  nloci = pairwise_all_loci[samples,samples]/Nfinal[[taxon1]] 
+  nloci[is.na(nloci)] = 0
+  nloci = as.dist(nloci)
+  nloci = 1 - nloci
+  
+  #samples = row.names(nloci)
+  
+  cat(paste('\n\n\n','Number of libraries',length(samples), ':\n'))
+  
+  
+  predictors = sample_info %>%
+    filter(samplename_ipyrad %in% samples) %>%
+    transmute(samplename_ipyrad = samplename_ipyrad,
+              WGA = factor(WGA), 
+              pool = factor(pool),
+              population = factor(population),
+              N_loci_s7 = log(as.integer(N_loci_s7))) %>%
+    tibble::remove_rownames() %>%
+    tibble::column_to_rownames('samplename_ipyrad')
+  
+  
+  #[match(samples,prun_sample_info_dup$samplename_ipyrad),c('WGA','pool','population','N_loci_s7')]
+  
+
+  #variables = colnames(predictors)
+  #predictors = data.frame(factor(predictors[[1]]),factor(predictors[[2]]),log(as.integer(predictors[[3]])))
+  #colnames(predictors) = variables
+  
+  mdmr_model = mdmr(D = nloci, X = predictors)
+  cat(paste('\n\n\n',taxon1,'\n\n'))
+  summary(mdmr_model)
+
+  
+}
+```
+

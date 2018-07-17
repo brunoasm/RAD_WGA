@@ -1,0 +1,366 @@
+---
+title: "Article S3: Clustering and isolation by distance"
+output:
+  pdf_document:
+    toc: yes
+    df_print: kable
+  html_document:
+    code_folding: hide
+    df_print: paged
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_float:
+      collapsed: no
+---
+
+In this notebook we will do a few simple population genetics analyses to ttest the use of ddRAD libraries prepared with Multiple Displacement Amplification (MDA)
+
+Let's start by loading packages
+
+```{r}
+library(adegenet)
+library(BEDASSLE)
+library(fossil)
+library(dplyr)
+library(RColorBrewer)
+library(ggplot2)
+library(broom)
+library(data.table)
+library(ggthemes)
+library(gridExtra)
+library(vegan)
+library(knitr)
+
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+```
+
+Now let's load the data:
+
+```{r}
+
+taxa = list.files('./',pattern = '.*gen$') %>%
+  gsub(pattern = '_filtered.*$',replacement = '')
+
+genpops = sapply(taxa,function(x){
+  paste(x,'.*gen$',sep='') %>%
+  list.files(path = './') %>%
+  read.genepop(ncode=3,quiet=FALSE)
+})
+
+sample_info = read.csv('sample_info_new_WGA.csv')
+
+pop_locations = read.csv('pop_locations.csv')
+
+```
+
+Now let's use DAPC to find clusters. We manually selected number of clusters according to variation in BIC for different number of clusters. 
+Basically, we selected the number of groups right before a sharp increase in BIC. In the case of **Anchylorhynchus**, number of clusters was ever decreasing. We selected 4 clusters because that is the point in which the curve seems to start flattening.
+
+This resulted in the following number of clusters:
+
+```{r}
+nclusters = c('Anchylorhynchus' = 4,
+              'Andranthobius' = 1,
+              'C_impar' = 3,
+              'M_bondari' = 2,
+              'M_ypsilon' = 2)
+```
+
+
+The following runs find.clusters (we first ran interactively to get the number of clusters above). To run interactively, one needs to change `choose.n.clust` to `FALSE`.
+```{r}
+dapcs = lapply(taxa,function(x){
+  tryCatch(expr = {
+    re = find.clusters(tab(genpops[[x]],freq=T,NA.method='mean'),choose.n.clust = FALSE,pca.select='percVar',perc.pca=75,n.clust = nclusters[x])
+    return(re)
+    },
+    error=function(e){
+      samps = rownames(genpops[[x]]$tab)
+      outvec = rep(1,length(samps))
+      names(outvec) = samps
+      re = list(grp=outvec)
+      return(re)
+    }
+  )
+  }
+  )
+names(dapcs) = taxa
+```
+
+
+Now let's plot make plots PCAs including genetic clusters and local populations. We will save plots in a list and make a multipnale plot later.
+
+```{r}
+titles = c('Anchylorhynchus' = 'Anchylorhynchus',
+           'Andranthobius' = 'Andranthobius',
+           'C_impar' = 'Celetes impar',
+           'M_bondari' = 'Microstrates bondari',
+           'M_ypsilon' = 'Microstrates ypsilon')
+plots=list()
+
+for (taxon in names(genpops)){
+  gendata = genpops[[taxon]]
+  
+  imputed = tab(gendata, freq=TRUE, NA.method = 'mean')
+  pca1 = dudi.pca(df = imputed, scale = FALSE, scannf = F, nf=20)
+  
+  xrange = range(pca1$li$Axis1) 
+  yrange = range(pca1$li$Axis2)
+  
+  xrangeplot = xrange + c(-1,1)*(xrange[2]-xrange[1])*0.3
+  yrangeplot = yrange + c(-1,1)*(yrange[2]-yrange[1])*0.3
+  
+  pc1_var = 100*pca1$eig[1]/sum(pca1$eig)
+  pc2_var = 100*pca1$eig[2]/sum(pca1$eig)
+  
+  localities = gsub('^.*_','',rownames(pca1$li)) %>%
+    factor
+  
+  samples = gsub('_.*$','',rownames(pca1$li))
+  
+  MDA = sample_info %>%
+    filter(samplename_ipyrad %in% samples) %>%
+    select(WGA) %>% 
+    unlist %>%
+    factor(ordered=T,levels=c('TRUE','FALSE'))
+  
+  plot_df = data.frame(sample = samples,
+                       locality = localities,
+                       cluster = dapcs[[taxon]]$grp,
+                       MDA = MDA,
+                       PC1 = pca1$li[,1],
+                       PC2 = pca1$li[,2])
+  
+  #Some groups have few data points, and stat_ellipse needs at least 3 points.To make ellipses consistently, we will double the number of points and put a small jitter. The idea is to simply enclose populations, not to be statistically accurate.
+  
+  ellipse_df = rbind(plot_df,plot_df) %>%
+    mutate(PC1 = PC1+rnorm(n = length(PC1),mean = ,sd=0.1),
+           PC2 = PC2+rnorm(n = length(PC2),mean = ,sd=0.1)) %>%
+    select(locality,PC1,PC2)
+  
+  centroids = plot_df %>%
+    group_by(cluster) %>%
+    summarise(cent.PC1 = mean(PC1),
+              cent.PC2 = mean(PC2)) %>%
+    right_join(plot_df)
+  
+  if (taxon == 'Anchylorhynchus'){
+    ellipses = NULL
+  }
+  else {
+    ellipses = stat_ellipse(aes(x=PC1, y=PC2, group=locality),linetype='dashed',data=ellipse_df,type='t',color='grey30') 
+  }
+    p = ggplot(plot_df) +
+    ellipses +
+    geom_segment(aes(x=PC1, y=PC2, xend=cent.PC1,yend=cent.PC2), data = centroids) +
+    geom_point(aes(x=PC1, y=PC2, color=MDA)) +
+    xlab(paste('PC1 (',sprintf('%.1f',pc1_var),'%)',sep='')) +
+    ylab(paste('PC2 (',sprintf('%.1f',pc2_var),'%)',sep='')) +
+    theme_tufte() +
+    theme(panel.border = element_rect(colour = "black", fill=NA)) +
+    scale_colour_manual(values = brewer.pal(n=3, name = 'RdYlBu')[c(1,3)], name = '',labels = c('FALSE'='gDNA','TRUE'='MDA')) +
+    ggtitle(bquote(italic(.(titles[taxon])))) +
+    scale_y_continuous(labels=function(x)sprintf('%1.1f',x))
+  
+  plots[[taxon]] = p
+  
+}
+```
+
+Now let's plot all of them together:
+
+```{r}
+#extract legend. From:
+#https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+my_legend = g_legend(plots[[1]])
+  
+p = grid.arrange(plots[[1]] + theme(legend.position='none'),
+                         plots[[2]] + theme(legend.position='none'),
+                         plots[[3]] + theme(legend.position='none'),
+                         plots[[4]] + theme(legend.position='none'),
+                         plots[[5]] + theme(legend.position='none'),
+                         my_legend, ncol=2)
+
+print(p)
+
+ggsave(filename = 'fig_DAPC.pdf',plot = p,device = 'pdf',path = 'plots/',width = 6.5, height=8, useDingbats=F)
+```
+
+Now we will look at the effect of MDA on isolation by distance. We will use only  **C. impar** only **Anchylorhynchus** is complicated and includes many species, while the other taxa have too few populations
+
+We will start by defining a function that calculates pairwise FSTs. The standard function in hierfstat seems to calculate FST wrongly. I am using the function in BEDASSLE, which implements the "ratio of averages" as defined by Bhatia G., Patterson N., Sankararaman S., Price AL. 2013. Estimating and interpreting FST: The impact of rare variants. Genome Research 23:1514–1521. DOI: 10.1101/gr.154831.113.
+
+```{r}
+get_pairwise_Fst = function(genmat,grp){
+  grp = factor(grp)
+  if (length(levels(grp)) > 1){
+    
+    allele.counts = apply(genmat@tab,2,function(x){
+      pops = grp
+      counts = tapply(x,pops,function(y){
+        sum(y,na.rm = T)
+      })
+      return(counts)
+    })
+    sample.sizes = apply(genmat@tab,2,function(x){
+      pops = grp
+      sizes = tapply(x,pops,function(y){
+        2*sum(!is.na(y))
+      })
+      return(sizes)
+    })
+    
+    Fst = calculate.all.pairwise.Fst(allele.counts,sample.sizes)
+    colnames(Fst) = rownames(Fst) = levels(grp)
+    #print(Fst)
+    return(tidy(as.dist(Fst,upper = FALSE)))
+  } else {
+    print('Only one pop')
+    return(matrix())
+  }
+}
+```
+
+Now let's calculate the pairwise geographical distances between populations
+```{r}
+
+geodist = earth.dist(pop_locations[c('lon','lat')], dist = FALSE)
+rownames(geodist) = colnames(geodist) = pop_locations$population
+
+geodist = geodist[sort(rownames(geodist)),sort(rownames(geodist))] %>%
+  as.dist(upper=TRUE) %>%
+  tidy() %>%
+  transmute(population1=item1,
+            population2=item2,
+            geo_distance=distance)
+
+head(geodist,n = 20)
+
+```
+
+
+
+Now let's calculate FSTs for **C. impar** (all samples, only MDA and only gDNA) and save results in a table
+```{r}
+FST = plyr::ldply(c('all','MDA','gDNA'), function(y){
+    samples =  rownames(genpops$C_impar@tab)
+    pops = gsub('^.+_','',samples)
+    samples = gsub('_.+$','',samples)
+    
+    if (y=='all'){
+      return(get_pairwise_Fst(genpops$C_impar,pops) %>% mutate(method = y))
+    }
+    else if (y == 'MDA'){
+      samples = sample_info %>%
+        filter(WGA == TRUE, samplename_ipyrad %in% samples) %>%
+        tidyr::unite('sample_pop',samplename_ipyrad, population) %>%
+        select(sample_pop) %>%
+        unlist
+      pops = gsub('^.+_','',samples)
+      return(get_pairwise_Fst(genpops$C_impar[samples],pops)%>% mutate(method = y))
+    }
+    else {
+      samples = sample_info %>%
+        filter(WGA == FALSE, samplename_ipyrad %in% samples) %>%
+        tidyr::unite('sample_pop',samplename_ipyrad, population) %>%
+        select(sample_pop) %>%
+        unlist
+      pops = gsub('^.+_','',samples)
+      return(get_pairwise_Fst(genpops$C_impar[samples],pops)%>% mutate(method = y))
+    }
+    
+    
+    
+  })
+
+FST = FST %>% transmute(method, population1=item1, population2=item2, FST=distance)
+
+FST
+
+```
+
+Now let's join geographical distance and linearize FST:
+
+```{r}
+FST_plot = FST %>% left_join(geodist) %>% mutate(FST = (FST)/(1-FST))
+FST_plot
+```
+
+Now let's plot:
+```{r}
+p = ggplot(FST_plot,aes(x=geo_distance, y = FST, color=method)) +
+  geom_point() +
+  geom_smooth(method=lm,se = FALSE) +
+  theme_tufte() +
+  theme(panel.border = element_rect(colour = "black", fill=NA)) +
+  scale_colour_manual(values = c('black',brewer.pal(n=3, name = 'RdYlBu')[c(3,1)]), name = '') +
+  ylab(bquote('F'['ST']/(1-'F'['ST']))) +
+  xlab('Geographical distance (km)')
+
+print(p)
+
+ggsave(filename = 'fig_Mantel.pdf',plot = p,device = 'pdf',path = 'plots/')
+  
+```
+
+Finally, let's do Mantel tests and see if results are different between methods:
+
+```{r}
+for (method in c('all','gDNA','MDA')){
+  
+  FST_mat = FST_plot %>%
+    filter(!!method == method) %>%
+    dcast(formula=population2~population1,value.var='FST') %>%
+    (function(x){rownames(x) = x[[1]]; return(x[-1])}) %>%
+    as.matrix 
+  
+  pops = base::union(rownames(FST_mat),colnames(FST_mat)) %>%
+    sort
+  
+  FST_dist = matrix(NA,nrow=length(pops),ncol=length(pops),dimnames = list(pops,pops))
+  
+  FST_dist[t(combn(pops,2))] = FST_mat[t(combn(pops,2))]
+  
+  FST_dist = FST_dist %>%
+    t %>%
+    as.dist
+  
+  
+  
+  geo_mat = FST_plot %>%
+    filter(!!method == method) %>%
+    dcast(formula=population2~population1,value.var='geo_distance') %>%
+    (function(x){rownames(x) = x[[1]]; return(x[-1])}) %>%
+    as.matrix
+   
+  geo_dist = matrix(NA,nrow=length(pops),ncol=length(pops),dimnames = list(pops,pops))
+  
+  geo_dist[t(combn(pops,2))] = geo_mat[t(combn(pops,2))]
+  
+  geo_dist = geo_dist %>%
+    t %>%
+    as.dist
+  
+  mantel_res = mantel(geo_dist,FST_dist)
+  print(method)
+  print(mantel_res)
+}
+```
+
+This lists number of samples per population Table S2:
+```{r}
+for (taxon in taxa){
+  print(taxon)
+  print(sample_info[sapply(sample_info$samplename_ipyrad,function(x)any(grepl(x,rownames(genpops[[taxon]]@tab)))),] %>% select(population,WGA) %>% table)
+}
+
+```
+
